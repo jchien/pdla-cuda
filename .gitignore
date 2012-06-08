@@ -1,0 +1,7 @@
+Debug
+Debug/*
+vc100.pdb
+pdla_cuda.vcxproj
+pdla_cuda.vcxproj.user
+*.csv
+*.xlsx
