@@ -21,7 +21,7 @@ int main(int argc, char** argv)
 {
 	//*
 	pdla::init_cuda();
-	pdla::pdla_result_t p = pdla::run(16);
+	pdla::pdla_result_t p = pdla::run(32);
 	std::cout << "Took " << p.elapsed << " seconds" << std::endl;
 	if(!pdla::save_to_file(p, "result.csv"))
 		std::cout << "Unable to save results";

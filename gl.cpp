@@ -49,8 +49,6 @@ static void display()
 	glColor3f(0, 0, 1.0f);
 	for(int i = 0; i < partIndex - 1; i++)
 		renderCircle(displaying.pos[i]);
-	glColor3f(1.0f, 0, 0);
-	renderCircle(displaying.oldPos[partIndex - 1]);
 	glColor3f(0, 1.0f, 0);
 	renderCircle(displaying.pos[partIndex - 1]);
 

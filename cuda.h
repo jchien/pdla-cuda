@@ -14,7 +14,7 @@ namespace pdla
 #define __PDLA_RESULT__
 	struct pdla_result_t
 	{
-		std::vector<pdla::vec> pos, oldPos;
+		std::vector<pdla::vec> pos;
 		std::vector<unsigned long long> time;
 		float elapsed;
 	};

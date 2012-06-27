@@ -23,6 +23,7 @@
 
 static dim3 gridDim3(GRID_SIZE, 1, 1), blockDim3(BLOCK_SIZE, 1, 1);
 
+// Initializes this vector to a random vector between minLen and maxLen (that has a random direction)
 CUDA_DEVICE_CALLABLE void pdla::vec::rand(curandState* rand, float minLen, float maxLen)
 {
 	float len = minLen + (maxLen - minLen) * curand_uniform(rand);
@@ -33,49 +34,31 @@ CUDA_DEVICE_CALLABLE void pdla::vec::rand(curandState* rand, float minLen, float
 
 __global__ void kernel(context_t* ctx)
 {
-	int local_i		= threadIdx.x;
-	int global_i	= blockIdx.x * blockDim.x + local_i;
-
-	// Get which seed and particle we're comparing
-#if PDLA_MODE
-	int seed		= (int)((float)global_i * ctx->numSeeds / NUM_KERNELS);
-	if(seed >= ctx->numSeeds)
-		seed = ctx->numSeeds - 1;
-	int part		= (int)(global_i - (float)seed * NUM_KERNELS / ctx->numSeeds);
-	if(part >= NUM_KERNELS / ctx->numSeeds)
+	int index = blockIdx.x * blockDim.x + threadIdx.x;
+	if(index >= ctx->numSeeds)
 		return;
-#else
-	int seed		= global_i;
-	if(seed >= ctx->numSeeds)
-		return;
-	int part		= 0;
-#endif
 
 	// PRNGs for the drifting particle
 	curandState partRand;
-	curand_init(part, ctx->numSeeds, 0, &partRand);
+	curand_init(ctx->randSeed, ctx->numSeeds, 0, &partRand);
 
 	// Setup particle data
-	unsigned long long seedT = ctx->seedT[seed];
-	pdla::vec seedPos(ctx->seedPos[seed]), oldPartPos, partPos, walk;
-	oldPartPos.rand(&partRand, ctx->maxRadius + 4, ctx->maxRadius + 5);
-
-#if KERNEL_DEBUG_1
-	// Debug output
-	ctx->debugArr[global_i].seed = seed;
-	ctx->debugArr[global_i].part = part;
-	ctx->debugArr[global_i].oldPart = oldPartPos;
-#endif
-
+	pdla::vec seedPos(ctx->seedPos[index]), oldPartPos, partPos, walk;
+	oldPartPos.rand(&partRand, ctx->maxRadius + 3, ctx->maxRadius + 4);
+	
 	// Until someone collided with something
-	for(unsigned long long time = 0; time < ctx->resTime; time++)
+	pdla_time_t time, resTime;
+	time = ctx->time;
+	// Cache resTime from the context so that we don't have to get it every time
+	while(time < (resTime = ctx->resTime))
 	{
-		// 1) Drift particle
-		walk.rand(&partRand, 0.4f, 0.6f);
-		partPos = oldPartPos + walk;
-		// Only check if the seed "existed then"
-		if(time >= seedT)
+		// Process in strides of 1024 to average out the cost of retrieving resTime
+		// TODO: figure out correct stride length as function of seed count
+		for(pdla_time_t maxTime = time + 1024; time < maxTime; time++)
 		{
+			// 1) Drift particle
+			walk.rand(&partRand, 0.4f, 0.6f);
+			partPos = oldPartPos + walk;
 			// 2) Check collision
 			pdla::vec seedVec = seedPos - oldPartPos;
 			float t = seedVec.dot(walk) / walk.dot(walk);
@@ -87,7 +70,7 @@ __global__ void kernel(context_t* ctx)
 			float dist = (seedPos - (oldPartPos + walk * t)).len();
 			if(dist < 2)
 			{
-				// Rewind so that part is touching seed
+				// Rewind so that particle is just touching seed
 				float sintheta, costheta;
 				__sincosf(acosf(seedVec.dot(walk) / (seedVec.len() * walk.len())),
 							&sintheta, &costheta);
@@ -101,21 +84,25 @@ __global__ void kernel(context_t* ctx)
 				ctx->res[index].time = time;
 				ctx->res[index].pos = partPos;
 			}
+			// 4) Set up for next iteration (bounding box)
+			oldPartPos = partPos;
+			oldPartPos.boundingBox(ctx->maxRadius + 4);
 		}
-		// 4) Set up for next iteration (bounding box)
-		oldPartPos = partPos;
-		oldPartPos.boundingBox(ctx->maxRadius + 8);
 	}
 }
 
 __global__ void addSeed(context_t* ctx)
 {
+	// Get index of first result
 	int minIndex = 0;
 	for(int i = 1; i < ctx->resCount; i++)
 		if(ctx->res[i].time < ctx->res[minIndex].time)
 			minIndex = i;
-
+	
+	// Get the first result
 	result_t res = ctx->res[minIndex];
+
+	// Set context
 	ctx->time = res.time + 1;
 	if(res.pos.len() > ctx->maxRadius)
 		ctx->maxRadius = res.pos.len();
@@ -139,13 +126,14 @@ pdla::pdla_result_t pdla::run(int numSeeds)
 		abort();
 	}
 
+	// Initialize device memory
 	thrust::device_vector<context_t>	ctx(1);
-	thrust::device_vector<debug_t>		debug(NUM_KERNELS);
 	thrust::device_vector<result_t>		results(NUM_KERNELS);
 	thrust::device_vector<vec>			seedPos(NUM_KERNELS + 1);
-	thrust::device_vector<unsigned long long>
-										seedT(NUM_KERNELS + 1);
+	thrust::device_vector<pdla_time_t>	seedT(NUM_KERNELS + 1);
 
+	// Initialize context
+	// Note: (thrust device vector).data().get() gets the pointer to device memory
 	context_t tmp;
 	tmp.randSeed = time(0);
 	tmp.time = 0;
@@ -156,80 +144,29 @@ pdla::pdla_result_t pdla::run(int numSeeds)
 	tmp.seedPos = seedPos.data().get();
 	tmp.seedT = seedT.data().get();
 	tmp.res = results.data().get();
-	tmp.debugArr = debug.data().get();
 
 	seedPos[0] = vec(0, 0);
 	seedT[0] = 0;
 	ctx[0] = tmp;
-
+	
+	// Take time
 	clock_t t0 = clock();
+	
+	// Send instructions to GPU
 	for(int i = 1; i < numSeeds; i++)
 	{
 		kernel<<<gridDim3, blockDim3>>>(ctx.data().get());
-		
-#if KERNEL_DEBUG_1
-		{
-			cudaThreadSynchronize();
-			std::cout << "i: " << i << std::endl; 
-			std::cout << "seeds: ";
-			for(int j = 0; j < debug.size(); j++)
-				std::cout << static_cast<debug_t>(debug[j]).seed << ", ";
-			std::cout << std::endl;
-			std::cout << "parts: ";
-			for(int j = 0; j < debug.size(); j++)
-				std::cout << static_cast<debug_t>(debug[j]).part << ", ";
-			std::cout << std::endl;
-
-			
-			context_t c = ctx[0];
-			if(c.resIndex < 0)
-				std::cout << "resIndex: " << c.resIndex << std::endl;
-			else
-			{
-				result_t res = static_cast<result_t>(results[c.resIndex]);
-				std::cout << "result: " << res.pos << "(" << res.pos.len() << ") at time t = " << res.time << std::endl;
-			}
-			//*
-			/*
-			std::cout << "oldPart: ";
-			for(int j = 0; j < debug.size(); j++)
-				std::cout << static_cast<debug_t>(debug[j]).oldPart << ", ";
-			std::cout << std::endl << std::endl;
-			// */
-		}
-#endif
-
 		addSeed<<<1, 1>>>(ctx.data().get());
-		
-#if KERNEL_DEBUG_2
-		{
-			cudaThreadSynchronize();
-			context_t c = ctx[0];
-			std::cout << "time: " << c.time << std::endl;
-			std::cout << "maxR: " << c.maxRadius << std::endl;
-			std::cout << "numSeeds: " << c.numSeeds << std::endl;
-			/*
-			std::cout << "seeds: ";
-			for(int j = 0; j < c.numSeeds; j++)
-				std::cout << static_cast<vec>(seedPos[j]) << " @ " << seedT[j] << ", ";
-			std::cout << std::endl << std::endl;
-			// */
-		}
-#endif
 	}
+	// Wait for execution to finish
 	cudaThreadSynchronize();
-#if KERNEL_DEBUG_3
-	context_t c = ctx[0];
-	std::cout << "seeds: ";
-	for(int j = 0; j < c.numSeeds; j++)
-		std::cout << static_cast<vec>(seedPos[j]) << " @ " << seedT[j] << ", ";
-	std::cout << std::endl << std::endl;
-#endif
+	
+	// Take time again
 	clock_t t1 = clock();
 
+	// Copy results from Thrust containers to STL containers
 	pdla_result_t p = {std::vector<vec>(numSeeds), 
-						std::vector<vec>(numSeeds),
-						std::vector<unsigned long long>(numSeeds),
+						std::vector<pdla_time_t>(numSeeds),
 						1.0f * (t1 - t0) / CLOCKS_PER_SEC};
 	for(int i = 0; i < numSeeds; i++)
 	{
